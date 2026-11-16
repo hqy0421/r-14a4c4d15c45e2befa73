@@ -17,6 +17,10 @@ ARRAY_API_CHECK = "check_array_api_input"
 GAUSSIAN_MIXTURE_ARRAY_API_REASON = (
     "wraps scikit-learn's GaussianMixture, which rejects init_params='kmeans' under array_api_dispatch"
 )
+GMM_CLASSIFIER_NAN_REASON = (
+    "GMMClassifier only accepts NaN in predict/predict_proba, where it marks an unobserved feature; "
+    "the allow_nan tag would also make fit accept NaN, which it must reject"
+)
 DATAFRAME_ARRAY_API_REASON = "groups X through a dataframe, which array_api_dispatch does not accept"
 
 
@@ -30,6 +34,21 @@ def expect_array_api_failure(
     applies it to every parametrized estimator.
     """
     return lambda estimator: {ARRAY_API_CHECK: reason} if not applies_to or isinstance(estimator, applies_to) else {}
+
+
+def expect_failed_checks(
+    *failures: tuple[str, str, tuple[type[BaseEstimator], ...] | None],
+) -> Callable[[BaseEstimator], dict[str, str]]:
+    """Build an `expected_failed_checks` callable from `(check_name, reason, applies_to)` tuples."""
+
+    def expected(estimator: BaseEstimator) -> dict[str, str]:
+        return {
+            check_name: reason
+            for check_name, reason, applies_to in failures
+            if not applies_to or isinstance(estimator, applies_to)
+        }
+
+    return expected
 
 
 def select_tests(include, exclude=[]):

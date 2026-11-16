@@ -1,10 +1,103 @@
 import numpy as np
-from scipy.special import softmax
+from scipy.special import logsumexp, softmax
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.mixture import GaussianMixture
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import FLOAT_DTYPES, check_is_fitted
 from sklearn_compat.utils.validation import validate_data
+
+_LOG_2PI = np.log(2.0 * np.pi)
+
+
+def _log_component_marginal_prob(X, gmm, observed):
+    """Log marginal density of every mixture component on a subset of observed features.
+
+    The features that are not in `observed` are integrated out of each fitted component, keeping the
+    correlations between the observed features intact. The component weights are included, so the result
+    can be reduced with `logsumexp` to obtain the log likelihood of the mixture.
+
+    Parameters
+    ----------
+    X : np.ndarray of shape (n_samples, n_observed)
+        The observed feature values.
+    gmm : GaussianMixture
+        A fitted mixture model.
+    observed : np.ndarray of shape (n_observed,)
+        Indices of the features present in `X`.
+
+    Returns
+    -------
+    np.ndarray of shape (n_samples, n_components)
+        The log probability of the observed features under each component.
+    """
+    n_samples, n_observed = X.shape
+    log_weights = np.log(gmm.weights_)
+    if n_observed == 0:
+        # Integrating out every feature leaves the mixture weights, which sum to one.
+        return np.broadcast_to(log_weights, (n_samples, log_weights.shape[0]))
+
+    means = gmm.means_[:, observed]
+    covariance_type = gmm.covariance_type
+    diff = X[:, None, :] - means[None, :, :]
+
+    if covariance_type in ("full", "tied"):
+        if covariance_type == "full":
+            covariance = gmm.covariances_[:, observed][:, :, observed]
+        else:
+            covariance = gmm.covariances_[np.ix_(observed, observed)]
+        chol = np.linalg.cholesky(covariance)
+        solved = np.linalg.solve(chol, diff.transpose(1, 2, 0))
+        quadratic = np.sum(solved**2, axis=1).T
+        log_det = 2.0 * np.sum(np.log(np.diagonal(chol, axis1=-2, axis2=-1)), axis=-1)
+    elif covariance_type in ("diag", "spherical"):
+        if covariance_type == "diag":
+            variances = gmm.covariances_[:, observed]
+        else:
+            variances = np.repeat(gmm.covariances_[:, None], n_observed, axis=1)
+        quadratic = np.sum(diff**2 / variances[None, :, :], axis=2)
+        log_det = np.sum(np.log(variances), axis=1)
+    else:  # pragma: no cover - guarded by sklearn's GaussianMixture
+        raise ValueError(f"Unknown covariance type: {covariance_type!r}")
+
+    return -0.5 * (n_observed * _LOG_2PI + log_det + quadratic) + log_weights
+
+
+def _log_mixture_prob(gmm, X):
+    """Log likelihood of `X` under a fitted mixture, treating `NaN` as a missing feature.
+
+    Rows without missing values are scored with the fitted mixture itself, so their result is identical to
+    `GaussianMixture.score_samples`. For rows with missing values the likelihood is evaluated on the marginal
+    distribution over the features that were actually observed.
+
+    Parameters
+    ----------
+    gmm : GaussianMixture
+        A fitted mixture model.
+    X : np.ndarray of shape (n_samples, n_features)
+        The data to score, possibly containing `NaN` values.
+
+    Returns
+    -------
+    np.ndarray of shape (n_samples,)
+        The log likelihood of each row.
+    """
+    scores = np.empty(X.shape[0])
+    missing = np.isnan(X)
+    complete = ~missing.any(axis=1)
+    if complete.any():
+        scores[complete] = gmm.score_samples(X[complete])
+
+    incomplete = np.flatnonzero(~complete)
+    if incomplete.size:
+        X_incomplete = X[incomplete]
+        patterns, pattern_index = np.unique(np.isnan(X_incomplete), axis=0, return_inverse=True)
+        for idx, pattern in enumerate(patterns):
+            rows = pattern_index == idx
+            observed = np.flatnonzero(~pattern)
+            component_scores = _log_component_marginal_prob(X_incomplete[rows][:, observed], gmm, observed)
+            scores[incomplete[rows]] = logsumexp(component_scores, axis=1)
+
+    return scores
 
 
 class GMMClassifier(ClassifierMixin, BaseEstimator):
@@ -16,6 +109,12 @@ class GMMClassifier(ClassifierMixin, BaseEstimator):
     !!! note
         All the parameters are an exact copy of those of
         [sklearn.mixture.GaussianMixture]( https://scikit-learn.org/stable/modules/generated/sklearn.mixture.GaussianMixture.html).
+
+    !!! info
+        Training data must be complete, but `predict` and `predict_proba` accept `np.nan` to mark features
+        that were not observed. Each row is then scored with the marginal likelihood of its observed features
+        (per mixture component, so correlations between observed features are preserved) instead of imputing
+        values. A row without any observed feature gets a uniform probability over the classes.
 
     Attributes
     ----------
@@ -142,7 +241,8 @@ class GMMClassifier(ClassifierMixin, BaseEstimator):
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            The data to predict.
+            The data to predict. Features that were not observed can be marked with `np.nan`; the
+            label is then based on the marginal likelihood of the observed features.
 
         Returns
         -------
@@ -150,12 +250,17 @@ class GMMClassifier(ClassifierMixin, BaseEstimator):
             The predicted data.
         """
         check_is_fitted(self, ["gmms_", "classes_"])
-        X = validate_data(self, X=X, dtype=FLOAT_DTYPES, reset=False)
+        X = validate_data(self, X=X, dtype=FLOAT_DTYPES, ensure_all_finite="allow-nan", reset=False)
 
         return self.classes_[self.predict_proba(X).argmax(axis=1)]
 
     def predict_proba(self, X):
         """Predict probabilities for `X` using fitted estimator.
+
+        Features that were not observed can be marked with `np.nan`. The probabilities are then computed
+        from the marginal distribution of the observed features, integrating out the missing ones for each
+        component of every class mixture while keeping the correlations between the observed features. Rows
+        without any observed feature yield a uniform distribution over the classes.
 
         Parameters
         ----------
@@ -168,9 +273,9 @@ class GMMClassifier(ClassifierMixin, BaseEstimator):
             The predicted probabilities.
         """
         check_is_fitted(self, ["gmms_", "classes_"])
-        X = validate_data(self, X=X, dtype=FLOAT_DTYPES, reset=False)
+        X = validate_data(self, X=X, dtype=FLOAT_DTYPES, ensure_all_finite="allow-nan", reset=False)
 
         res = np.zeros((X.shape[0], self.classes_.shape[0]))
         for idx, c in enumerate(self.classes_):
-            res[:, idx] = self.gmms_[c].score_samples(X)
+            res[:, idx] = _log_mixture_prob(self.gmms_[c], X)
         return softmax(res, axis=1)
